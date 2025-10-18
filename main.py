@@ -1,34 +1,39 @@
 import os
+import json
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ==== Google Sheets Auth ====
+# ==== Google Sheets Auth Setup ====
 
-# Full access to read/write Google Sheets
+# 1️⃣ Create /app/sa.json dynamically from environment variable
+if not os.path.exists("/app/sa.json"):
+    sa_content = os.getenv("GCP_SA_JSON")
+    if not sa_content:
+        raise ValueError("❌ Environment variable GCP_SA_JSON is missing — please add it in Railway Variables.")
+    with open("/app/sa.json", "w") as f:
+        f.write(sa_content)
+    print("✅ Created /app/sa.json from environment variable")
+
+# 2️⃣ Define authentication parameters
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-# Path to the service account JSON
-GCP_JSON_PATH = os.getenv("GCP_SA_JSON_PATH", "/app/sa.json")
-
-# Spreadsheet name
+GCP_JSON_PATH = "/app/sa.json"
 SHEET_NAME = os.getenv("SHEET_NAME", "AI_Playbook")
 
-# Create credentials
-creds = Credentials.from_service_account_file(GCP_JSON_PATH, scopes=SCOPES)
-
-# Authorize with gspread
-gc = gspread.authorize(creds)
-
-# Open or create the spreadsheet
+# 3️⃣ Authorize credentials and connect to Google Sheets
 try:
-    sh = gc.open(SHEET_NAME)
-except gspread.SpreadsheetNotFound:
-    print(f"Spreadsheet '{SHEET_NAME}' not found — creating a new one.")
-    sh = gc.create(SHEET_NAME)
-    share_email = os.getenv("SHARE_EMAIL")
-    if share_email:
-        sh.share(share_email, perm_type="user", role="writer")
-except Exception as e:
-    raise RuntimeError(f"Error accessing Google Sheet: {e}")
+    creds = Credentials.from_service_account_file(GCP_JSON_PATH, scopes=SCOPES)
+    gc = gspread.authorize(creds)
 
-print(f"✅ Connected to Google Sheet: {SHEET_NAME}")
+    try:
+        sh = gc.open(SHEET_NAME)
+    except gspread.SpreadsheetNotFound:
+        print(f"Spreadsheet '{SHEET_NAME}' not found — creating a new one.")
+        sh = gc.create(SHEET_NAME)
+        share_email = os.getenv("SHARE_EMAIL")
+        if share_email:
+            sh.share(share_email, perm_type="user", role="writer")
+
+    print(f"✅ Connected to Google Sheet: {SHEET_NAME}")
+
+except Exception as e:
+    raise RuntimeError(f"❌ Error connecting to Google Sheets: {e}")
