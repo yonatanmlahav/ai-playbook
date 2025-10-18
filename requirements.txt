@@ -5,6 +5,5 @@ numpy==2.1.0
 pandas==2.2.2
 gspread==6.0.2
 google-auth==2.33.0
-xgboost==2.1.1
 yfinance==0.2.41
 python-telegram-bot==21.3
