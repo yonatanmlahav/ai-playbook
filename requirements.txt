@@ -1,4 +1,3 @@
-
 fastapi
 uvicorn
 pydantic
@@ -8,3 +7,4 @@ gspread
 google-auth
 xgboost
 yfinance
+python-telegram-bot
