@@ -6,21 +6,35 @@ import threading
 
 app = FastAPI(title="AI Playbook", version="1.0.0")
 
-SHEET_ID = os.getenv("SPREADSHEET_ID")
-SA_PATH = "/app/sa.json"
+# ---------- Config ----------
+SHEET_ID = os.getenv("SPREADSHEET_ID")   # או None אם תעדיף להשתמש בשם
+SA_PATH = os.getenv("GCP_SA_JSON_PATH", "/app/sa.json")
 
+# ---------- Full Scopes ----------
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/drive.file"
 ]
 
 def connect_to_sheets():
     try:
         creds = Credentials.from_service_account_file(SA_PATH, scopes=SCOPES)
         gc = gspread.authorize(creds)
-        sh = gc.open_by_key(SHEET_ID)
-        print(f"✅ Connected to Sheet: {SHEET_ID}")
+
+        if SHEET_ID:
+            sh = gc.open_by_key(SHEET_ID)
+        else:
+            sh = gc.open(os.getenv("SHEET_NAME", "AI_Playbook"))
+
+        print(f"✅ Connected to Google Sheets successfully")
         return sh
+
+    except gspread.exceptions.APIError as e:
+        print(f"❌ APIError: {e}")
+        print("⚠️ Check that the Drive API is enabled and the scopes are complete.")
+        return None
+
     except Exception as e:
         print(f"⚠️ Google Sheets connection failed: {e}")
         return None
