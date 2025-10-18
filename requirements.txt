@@ -1,8 +1,8 @@
-fastapi==0.115.0
+astapi==0.115.0
 uvicorn==0.30.0
 pydantic==2.8.2
 numpy==2.1.0
-pandas==2.2.2
+pandas==2.1.4
 gspread==6.0.2
 google-auth==2.33.0
 yfinance==0.2.41
