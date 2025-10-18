@@ -1,51 +1,37 @@
-# 🧠 AI-Driven Trading Playbook
+# AI-Driven Trading Playbook (FastAPI + Google Sheets)
 
-An automated pipeline that detects *A-Ready* swing and intraday setups using technical and contextual signals, scores them via AI, and logs them to Google Sheets — ready for trade execution.
-
----
-
-## ⚙️ Architecture
-
-**TradingView → FastAPI → Google Sheets → AI Learning Loop**
-
-1. **TradingView Indicator (Pine v5)**  
-   Detects high-probability breakouts based on:
-   - RSI 55–65 rising  
-   - MACD > 0 and > signal  
-   - Breakout > recent high  
-   - Volume spike vs 20-SMA  
-   - Optional gap and price filters  
-
-2. **Webhook API (FastAPI + Railway)**  
-   Receives alerts, enriches with live Yahoo Finance data, computes an `A_Score (0–100)` and ranks each signal (A/B/C).  
-   Writes the data into Google Sheets (`Today_Watchlist` and `Alerts_Log`).
-
-3. **Google Sheets Dashboard**  
-   Displays real-time ranked tickers, market context, and historical performance for training.
-
-4. **Learning Loop (XGBoost)**  
-   Uses labeled trade outcomes (Win/Loss, R-multiple) to retrain weights weekly and improve precision.
+This project automates your **Top-Down Hybrid Playbook** using an AI-driven scoring pipeline.  
+It receives real-time alerts from **TradingView**, computes an **A-Score (0–100)**,  
+logs the data to **Google Sheets**, and ranks tickers (A/B/C) for trading decisions.
 
 ---
 
-## 🚀 Deployment Guide
+## 🧩 Features
+- ✅ Receives TradingView webhook alerts in real-time  
+- ✅ Computes dynamic A-Score based on RSI, MACD, Volume Spike & Breakout strength  
+- ✅ Writes signals to Google Sheets automatically  
+- ✅ Works entirely from environment variables (no files needed)  
+- ✅ Ready for deployment on **Railway**, **Render**, or **Google Cloud Run**
 
-### 1️⃣ Prerequisites
-- A [Google Cloud Service Account JSON](https://console.cloud.google.com/iam-admin/serviceaccounts)
-- A Google Sheet named `AI_Playbook`
-- Your TradingView indicator (included in this repo)
-- Railway account connected to GitHub
+---
 
-### 2️⃣ Environment Variables
-In Railway → Project → **Variables**, set:
+## ⚙️ Architecture Overview
+1. **TradingView Pine Script** detects "A-Ready" setups and sends JSON alerts.
+2. **FastAPI endpoint** (`/webhook`) receives and scores the signal.
+3. **Google Sheets integration** logs and ranks each alert.
+4. (Optional) Add a Telegram bot to push Rank A alerts.
 
-| Variable | Example |
-|-----------|----------|
-| `GCP_SA_JSON_PATH` | `/app/sa.json` |
-| `SHEET_NAME` | `AI_Playbook` |
-| `SHARE_EMAIL` | your@email.com |
+---
 
-Then upload your `sa.json` via Railway → **Files** → `/app/sa.json`.
-
-### 3️⃣ Webhook URL
-After deployment, Railway will give you a public URL such as:
+## 🧠 Example JSON Payload
+```json
+{
+  "symbol": "GWH",
+  "tf": "15m",
+  "price": 11.04,
+  "rsi": 60.1,
+  "macd": 0.23,
+  "volSpike": 2.4,
+  "breakoutPct": 0.035,
+  "gapPct": 0.02
+}
