@@ -1,37 +1,71 @@
-# AI-Driven Trading Playbook (FastAPI + Google Sheets)
+# 🧠 AI-Driven Playbook — Server-Side Market Scanner
 
-This project automates your **Top-Down Hybrid Playbook** using an AI-driven scoring pipeline.  
-It receives real-time alerts from **TradingView**, computes an **A-Score (0–100)**,  
-logs the data to **Google Sheets**, and ranks tickers (A/B/C) for trading decisions.
+A fully automated **FastAPI + Google Sheets + Telegram** backend that receives alerts from **TradingView**, scores them using your *Top-Down Hybrid* playbook, ranks them (A/B/C), and logs everything to Google Sheets.
 
 ---
 
-## 🧩 Features
-- ✅ Receives TradingView webhook alerts in real-time  
-- ✅ Computes dynamic A-Score based on RSI, MACD, Volume Spike & Breakout strength  
-- ✅ Writes signals to Google Sheets automatically  
-- ✅ Works entirely from environment variables (no files needed)  
-- ✅ Ready for deployment on **Railway**, **Render**, or **Google Cloud Run**
+## 🚀 System Overview
+
+
+TradingView (Pine v5)
+↓ JSON webhook
+FastAPI server (Railway)
+↓ enriches data via yfinance
+↓ computes A_Score (0–100)
+↓ writes to Google Sheets
+↓ sends Telegram alerts for Rank A
 
 ---
 
-## ⚙️ Architecture Overview
-1. **TradingView Pine Script** detects "A-Ready" setups and sends JSON alerts.
-2. **FastAPI endpoint** (`/webhook`) receives and scores the signal.
-3. **Google Sheets integration** logs and ranks each alert.
-4. (Optional) Add a Telegram bot to push Rank A alerts.
+## ⚙️ Features
+
+✅ FastAPI webhook that receives live alerts from TradingView  
+✅ Computes an **A_Score** based on RSI, MACD, Volume Spike, Breakout %, Gap %, ATR %, Float, and Market Trend  
+✅ Writes data into two sheets:
+- `Today_Watchlist`
+- `Alerts_Log`
+
+✅ Auto-shares your sheet with your Google account  
+✅ Sends **Telegram alerts** when Rank = A  
+✅ `/health` endpoint checks connectivity to Sheets + Telegram  
+✅ Clean, production-ready, Railway-friendly
 
 ---
 
-## 🧠 Example JSON Payload
-```json
-{
-  "symbol": "GWH",
-  "tf": "15m",
-  "price": 11.04,
-  "rsi": 60.1,
-  "macd": 0.23,
-  "volSpike": 2.4,
-  "breakoutPct": 0.035,
-  "gapPct": 0.02
-}
+## 📁 Project Files
+
+| File | Description |
+|------|--------------|
+| `main.py` | FastAPI backend — receives alerts, scores, logs, sends alerts |
+| `requirements.txt` | Python dependencies |
+| `README.md` | This file — setup guide |
+| *(optional)* `train.py` | (future) ML learning loop with XGBoost |
+
+---
+
+## 🧩 Environment Variables (set in Railway)
+
+| Name | Example | Description |
+|------|----------|-------------|
+| `SHEET_NAME` | `AI_Playbook` | Your Google Sheet name |
+| `SHARE_EMAIL` | `youremail@gmail.com` | Account to share the sheet with |
+| `GCP_SA_JSON` | `{ "type": "service_account", ... }` | Full service account JSON |
+| `GCP_SA_JSON_PATH` | `/app/sa.json` | Default service account path |
+| `TELEGRAM_TOKEN` | `8111708783:AAE...` | Telegram Bot token |
+| `TELEGRAM_CHAT_ID` | `123456789` | Your Telegram chat ID |
+
+💡 *All variables must be marked as “Build & Runtime” in Railway.*
+
+---
+
+## 🧱 Deploy to Railway
+
+1. Create a new repo (or use your existing one):
+main.py
+requirements.txt
+README.md
+2. Push to GitHub:
+```bash
+git add .
+git commit -m "Initial AI Playbook backend"
+git push origin main
