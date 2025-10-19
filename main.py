@@ -247,5 +247,13 @@ async def webhook(alert: Alert):
         sector, flt = fetch_meta(alert.symbol)
         mkt = market_condition()
 
-        score = compute_score(alert.rsi, alert.macd, alert.volSpike,
-                              alert
+       score = compute_score(
+    alert.rsi,
+    alert.macd,
+    alert.volSpike,
+    alert.breakoutPct,
+    alert.gapPct,
+    atrp,
+    flt,
+    mkt
+)
