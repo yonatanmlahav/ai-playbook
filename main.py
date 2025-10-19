@@ -1,64 +1,62 @@
 import os
 import time
-import math
 import logging
-from typing import Optional, Tuple
 import json
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
 import gspread
 from google.oauth2.service_account import Credentials
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-# =========================
-# Logging
-# =========================
+# ==============================
+# LOGGING
+# ==============================
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
-log = logging.getLogger("ai-playbook")
+log = logging.getLogger("AI_Playbook")
 
-# =========================
-# Environment Variables
-# =========================
+# ==============================
+# CONFIG
+# ==============================
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 SHEET_NAME = os.getenv("SHEET_NAME", "AI_Playbook")
+SHARE_EMAIL = os.getenv("SHARE_EMAIL", "")
 GCP_SA_JSON_PATH = os.getenv("GCP_SA_JSON_PATH", "/app/sa.json")
 GCP_SA_JSON = os.getenv("GCP_SA_JSON")
-SHARE_EMAIL = os.getenv("SHARE_EMAIL", "")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# =========================
-# Initialize App
-# =========================
-app = FastAPI(title="AI Playbook — Server-Side Market Scanner", version="1.3.0")
+DEFAULT_FLOAT_M = 50.0
 
-# =========================
-# Google Sheets Auth
-# =========================
+# ==============================
+# APP INIT
+# ==============================
+app = FastAPI(title="AI Playbook — Market Scanner", version="1.4.0")
+
+# ==============================
+# GOOGLE SHEETS AUTH
+# ==============================
 def build_credentials():
-    """Builds Google credentials from file or env JSON."""
     try:
         if os.path.exists(GCP_SA_JSON_PATH):
-            return Credentials.from_service_account_file(GCP_SA_JSON_PATH, scopes=SCOPES)
+            creds = Credentials.from_service_account_file(GCP_SA_JSON_PATH, scopes=SCOPES)
         elif GCP_SA_JSON:
-            info = json.loads(GCP_SA_JSON)
-            return Credentials.from_service_account_info(info, scopes=SCOPES)
+            creds = Credentials.from_service_account_info(json.loads(GCP_SA_JSON), scopes=SCOPES)
         else:
-            raise FileNotFoundError("No Google credentials found.")
+            raise FileNotFoundError("Service Account JSON not found.")
+        return creds
     except Exception as e:
-        log.error(f"Google auth failed: {e}")
         send_telegram(f"⚠️ Google Sheets authentication failed:\n{e}")
         raise
 
 def ensure_sheets():
-    """Ensures main spreadsheet and worksheets exist."""
     creds = build_credentials()
     gc = gspread.authorize(creds)
 
@@ -66,13 +64,13 @@ def ensure_sheets():
         sh = gc.open(SHEET_NAME)
         log.info(f"Connected to sheet: {SHEET_NAME}")
     except Exception:
-        log.warning(f"Sheet '{SHEET_NAME}' not found, creating new one.")
+        log.warning(f"Sheet '{SHEET_NAME}' not found — creating new one.")
         sh = gc.create(SHEET_NAME)
         if SHARE_EMAIL:
             try:
                 sh.share(SHARE_EMAIL, perm_type="user", role="writer")
             except Exception as e:
-                log.warning(f"Could not share sheet: {e}")
+                log.warning(f"Failed to share sheet: {e}")
 
     headers_watch = [
         "Timestamp","Symbol","TF","Price","RSI","MACD","VolSpike","Breakout%","Gap%",
@@ -83,8 +81,7 @@ def ensure_sheets():
         "A_Score","Rank","Outcome","R","Notes"
     ]
 
-    # Ensure worksheets
-    def setup_worksheet(title, headers):
+    def setup_ws(title, headers):
         try:
             ws = sh.worksheet(title)
         except gspread.WorksheetNotFound:
@@ -97,15 +94,14 @@ def ensure_sheets():
             ws.insert_row(headers, 1)
         return ws
 
-    watch = setup_worksheet("Today_Watchlist", headers_watch)
-    logsheet = setup_worksheet("Alerts_Log", headers_log)
+    watch = setup_ws("Today_Watchlist", headers_watch)
+    logsheet = setup_ws("Alerts_Log", headers_log)
     return watch, logsheet
 
-# =========================
-# Telegram
-# =========================
+# ==============================
+# TELEGRAM
+# ==============================
 def send_telegram(text: str) -> bool:
-    """Sends a Telegram message if credentials exist."""
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         return False
     try:
@@ -118,35 +114,14 @@ def send_telegram(text: str) -> bool:
         return False
 
 def telegram_self_test():
-    """Sends a startup self-test message."""
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            send_telegram("✅ AI Playbook server is live — Telegram connection OK.")
-            log.info("Telegram self-test sent successfully.")
-        except Exception as e:
-            log.warning(f"Telegram self-test failed: {e}")
+        send_telegram("✅ AI Playbook server is live — Telegram connection OK.")
     else:
         log.info("Telegram not configured — skipping self-test.")
 
-# =========================
-# Data Models
-# =========================
-class Alert(BaseModel):
-    symbol: str
-    tf: str
-    price: float
-    rsi: float
-    macd: float
-    volSpike: float
-    breakoutPct: float
-    gapPct: float
-    ts: Optional[float] = None
-
-# =========================
-# Helpers
-# =========================
-DEFAULT_FLOAT_M = 50.0
-
+# ==============================
+# HELPERS
+# ==============================
 def calc_atr_percent(sym: str) -> Tuple[Optional[float], Optional[float]]:
     try:
         hist = yf.Ticker(sym).history(period="2mo", interval="1d")
@@ -159,7 +134,7 @@ def calc_atr_percent(sym: str) -> Tuple[Optional[float], Optional[float]]:
         last_close = close.iloc[-1]
         return float(atr), float(atr / last_close)
     except Exception as e:
-        log.warning(f"ATR failed for {sym}: {e}")
+        log.warning(f"ATR calc failed for {sym}: {e}")
         return None, None
 
 def fetch_meta(sym: str) -> Tuple[str, float]:
@@ -208,34 +183,44 @@ def upsert_row(ws, data: dict):
     for i, row in enumerate(rows, start=2):
         if len(row) >= max(symbol_idx, tf_idx):
             if row[symbol_idx-1] == data["Symbol"] and row[tf_idx-1] == data["TF"]:
-                end_col = gspread.utils.rowcol_to_a1(1, len(header)).split("A")[1]
-                ws.update(f"A{i}:{end_col}{i}", [row_values])
+                ws.update(f"A{i}:{gspread.utils.rowcol_to_a1(i, len(header)).split(':')[0]}", [row_values])
                 return "updated"
     ws.append_row(row_values)
     return "inserted"
 
-# =========================
-# Initialize Sheets + Telegram self-test
-# =========================
+# ==============================
+# MODELS
+# ==============================
+class Alert(BaseModel):
+    symbol: str
+    tf: str
+    price: float
+    rsi: float
+    macd: float
+    volSpike: float
+    breakoutPct: float
+    gapPct: float
+    ts: Optional[float] = None
+
+# ==============================
+# INIT SHEETS
+# ==============================
 watch_ws, log_ws = ensure_sheets()
 telegram_self_test()
 
-# =========================
-# Routes
-# =========================
+# ==============================
+# ROUTES
+# ==============================
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Server running successfully"}
+    return {"status": "ok", "message": "AI Playbook server is live"}
 
 @app.get("/health")
 def health():
-    """Checks connectivity to Sheets and Telegram."""
     try:
-        test_symbol = "TEST"
-        watch_ws.append_row(["TEST", test_symbol, "1h", 0, 0, 0, 0, 0, 0, 0, 0, "", "", 0, "C", "Health check", ""],
-                            value_input_option="USER_ENTERED")
+        _ = watch_ws.title
         send_telegram("✅ Health check passed — Sheets and Telegram OK.")
-        return {"ok": True}
+        return {"ok": True, "sheet": SHEET_NAME}
     except Exception as e:
         send_telegram(f"⚠️ Health check failed:\n{e}")
         return {"ok": False, "error": str(e)}
@@ -247,13 +232,41 @@ async def webhook(alert: Alert):
         sector, flt = fetch_meta(alert.symbol)
         mkt = market_condition()
 
-       score = compute_score(
-    alert.rsi,
-    alert.macd,
-    alert.volSpike,
-    alert.breakoutPct,
-    alert.gapPct,
-    atrp,
-    flt,
-    mkt
-)
+        score = compute_score(alert.rsi, alert.macd, alert.volSpike,
+                              alert.breakoutPct, alert.gapPct, atrp, flt, mkt)
+        rank = rank_from_score(score)
+
+        reason = (
+            f"RSI≈{alert.rsi:.1f}, MACDΔ≈{alert.macd:.2f}, Vol×{alert.volSpike:.1f}, "
+            f"BO {alert.breakoutPct:.1%}, Gap {alert.gapPct:.1%}, "
+            f"ATR% {((atrp or 0)*100):.1f}, Float {flt:.0f}M, {mkt}"
+        )
+        link = f"https://www.tradingview.com/chart/?symbol={alert.symbol}"
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+
+        # Log immutable
+        log_ws.append_row(
+            [ts, alert.symbol, alert.tf, alert.price, alert.rsi, alert.macd,
+             alert.volSpike, alert.breakoutPct, alert.gapPct, score, rank, "", "", ""],
+            value_input_option="USER_ENTERED"
+        )
+
+        # Upsert Today_Watchlist
+        action = upsert_row(watch_ws, {
+            "Timestamp": ts, "Symbol": alert.symbol, "TF": alert.tf,
+            "Price": alert.price, "RSI": alert.rsi, "MACD": alert.macd,
+            "VolSpike": alert.volSpike, "Breakout%": alert.breakoutPct,
+            "Gap%": alert.gapPct, "ATR%": (atrp or 0), "Float(M)": flt,
+            "Sector": sector, "MktCond": mkt, "A_Score": score, "Rank": rank,
+            "Reason": reason, "Link": link
+        })
+
+        if rank == "A":
+            send_telegram(f"🚨 A-Trigger {alert.symbol} ({alert.tf}) — Score {score}\n{reason}\n{link}")
+
+        return {"ok": True, "score": score, "rank": rank, "action": action}
+
+    except Exception as e:
+        log.exception("Webhook error")
+        send_telegram(f"❌ Webhook error:\n{e}")
+        raise HTTPException(status_code=500, detail=str(e))
