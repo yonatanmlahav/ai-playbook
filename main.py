@@ -76,7 +76,7 @@ def ensure_sheet_and_headers():
                 sh.share(SHARE_EMAIL, perm_type="user", role="writer")
                 log.info(f"Shared '{SHEET_NAME}' with {SHARE_EMAIL}")
             except Exception as e:
-                log.warning(f"Failed sharing with {SHARE_EMAIL}: {e}")
+                log.warning(f"Failed sharing with {SHARE_EMAIL}: {e}"
 
     # Define headers (must match your Blueprint)
     watch_header = [
@@ -137,6 +137,19 @@ def send_telegram(text: str) -> bool:
     except Exception as e:
         log.warning(f"Telegram send failed: {e}")
         return False
+def telegram_self_test():
+    """Sends a startup test message to confirm Telegram connectivity."""
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            ok = send_telegram("✅ AI Playbook server is live — Telegram connected successfully.")
+            if ok:
+                log.info("Telegram self-test sent successfully.")
+            else:
+                log.warning("Telegram self-test failed to send.")
+        except Exception as e:
+            log.warning(f"Telegram self-test error: {e}")
+    else:
+        log.info("Telegram not configured — skipping self-test.")
 
 # =========================
 # Models
