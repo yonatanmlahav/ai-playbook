@@ -7,15 +7,26 @@ import yfinance as yf
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
 
-# Optional integrations
-USE_TELEGRAM = bool(os.getenv("TELEGRAM_TOKEN")) and bool(os.getenv("TELEGRAM_CHAT_ID"))
-USE_SHEETS   = bool(os.getenv("SHEET_NAME")) and (bool(os.getenv("GCP_SA_JSON")) or bool(os.getenv("GCP_SA_JSON_PATH")))
+# ---------------------- Integrations ----------------------
 
+# Telegram integration
+USE_TELEGRAM = bool(os.getenv("TELEGRAM_BOT_TOKEN")) and bool(os.getenv("TELEGRAM_CHAT_ID"))
+tg_bot = None
+TG_CHAT_ID = None
 if USE_TELEGRAM:
-    from telegram import Bot
-    tg_bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
-    TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+    try:
+        from telegram import Bot
+        tg_bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+        TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+        print("✅ Telegram initialized")
+    except Exception as e:
+        print("❌ Telegram init failed:", e)
+        USE_TELEGRAM = False
 
+# Google Sheets integration
+USE_SHEETS = bool(os.getenv("SHEET_NAME")) and (
+    bool(os.getenv("GCP_SA_JSON")) or bool(os.getenv("GCP_SA_JSON_PATH"))
+)
 if USE_SHEETS:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -75,7 +86,10 @@ def score_row(row: pd.Series) -> Dict[str, Any]:
 
 # ---------------------- Scanner Core ----------------------
 
-DEFAULT_UNIVERSE = os.getenv("UNIVERSE", "AAPL,MSFT,NVDA,AMD,AMZN,META,GOOGL,IONQ,SOUN,RBLX,MSTR,GWH,LAC,HBM,SOFI,AFRM,NET,DDOG,CRDO,ABNB,SHOP,TSLA,PLTR,ROKU,SNAP,INTC,AVGO,LLY,NKE,NRG,DKNG,AES").split(',')
+DEFAULT_UNIVERSE = os.getenv(
+    "UNIVERSE",
+    "AAPL,MSFT,NVDA,AMD,AMZN,META,GOOGL,IONQ,SOUN,RBLX,MSTR,GWH,LAC,HBM,SOFI,AFRM,NET,DDOG,CRDO,ABNB,SHOP,TSLA,PLTR,ROKU,SNAP,INTC,AVGO,LLY,NKE,NRG,DKNG,AES"
+).split(',')
 
 class ScanParams(BaseModel):
     universe: List[str] = DEFAULT_UNIVERSE
@@ -87,7 +101,6 @@ class ScanParams(BaseModel):
     lookback_high: int = 20
     breakout_mult: float = 1.02
 
-
 def enrich_and_score(tickers: List[str], period: str, interval: str, lookback_high: int, breakout_mult: float) -> pd.DataFrame:
     if not tickers:
         return pd.DataFrame()
@@ -95,21 +108,11 @@ def enrich_and_score(tickers: List[str], period: str, interval: str, lookback_hi
     data = yf.download(tickers=tickers, period=period, interval=interval, auto_adjust=False, progress=False, group_by='ticker', threads=True)
     rows: List[Dict[str, Any]] = []
 
-    # Single-ticker case: yfinance returns a single-level columns DF
-    single = False
-    if isinstance(data.columns, pd.MultiIndex) is False:
-        single = True
+    single = isinstance(data.columns, pd.MultiIndex) is False
 
     for t in tickers:
         try:
-            df = None
-            if single:
-                df = data.copy()
-            else:
-                if t not in data.columns.levels[0]:
-                    continue
-                df = data[t].copy()
-
+            df = data.copy() if single else data[t].copy()
             df = df.dropna()
             if df.empty or len(df) < 60:
                 continue
@@ -144,8 +147,7 @@ def enrich_and_score(tickers: List[str], period: str, interval: str, lookback_hi
                 "score": s['score'],
                 "rating": s['rating']
             })
-        except Exception as e:
-            # Skip problematic ticker
+        except Exception:
             continue
 
     df_out = pd.DataFrame(rows)
@@ -185,42 +187,40 @@ def append_to_sheets(df: pd.DataFrame, worksheet_name: str = "Today_Watchlist"):
     for r in rows:
         ws.append_row(r)
 
-
 def notify_telegram(df: pd.DataFrame):
     if not USE_TELEGRAM or df.empty:
         return
     top = df[df['rating'] == 'A'].head(10)
     if top.empty:
         return
-    lines = ["🔥 A‑Ready Breakouts (Server Scanner) 🔥"]
+    lines = ["🔥 A-Ready Breakouts (Server Scanner) 🔥"]
     for _, row in top.iterrows():
         lines.append(f"{row['symbol']}: {row['close']} | RSI {row['rsi']} | Vol× {row['vol_x']} | Score {row['score']}")
     msg = "\n".join(lines)
-    tg_bot.send_message(chat_id=TG_CHAT_ID, text=msg)
+    try:
+        tg_bot.send_message(chat_id=TG_CHAT_ID, text=msg)
+    except Exception as e:
+        print("❌ Telegram send failed:", e)
 
 # ---------------------- API Endpoints ----------------------
 
 @app.post("/scan")
 def scan(params: ScanParams):
-    # Filter universe roughly by price/volume using latest close via yf fast info (lightweight)
     universe = [t.strip().upper() for t in params.universe if t.strip()]
     df = enrich_and_score(universe, params.period, params.interval, params.lookback_high, params.breakout_mult)
     if df.empty:
         return {"count": 0, "results": []}
 
-    # Hard filters
     df = df[(df['close'] >= params.price_min) & (df['close'] <= params.price_max) & (df['volume'] >= params.vol_min)]
     df = df.reset_index(drop=True)
 
-    # Write & notify
     append_to_sheets(df)
     notify_telegram(df)
 
     return {"count": int(len(df)), "results": df.to_dict(orient='records')}
 
 @app.get("/scan/simple")
-def scan_simple(universe: str = Query(
-        ",".join(DEFAULT_UNIVERSE), description="Comma-separated tickers")):
+def scan_simple(universe: str = Query(",".join(DEFAULT_UNIVERSE), description="Comma-separated tickers")):
     tickers = [t.strip().upper() for t in universe.split(',') if t.strip()]
     df = enrich_and_score(tickers, "6mo", "1d", 20, 1.02)
     if df.empty:
@@ -230,4 +230,4 @@ def scan_simple(universe: str = Query(
 # ---------------------- CLI helper ----------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
