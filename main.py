@@ -1,257 +1,233 @@
-import os
-import time
-import math
-import logging
-from collections import deque
-from contextlib import asynccontextmanager
-from typing import Optional, Tuple
+import os, time, math, json
+from typing import List, Dict, Any
 
 import numpy as np
-import gspread
-from fastapi import FastAPI, Request
-from google.oauth2.service_account import Credentials
-from joblib import load
+import pandas as pd
+import yfinance as yf
+from fastapi import FastAPI, Query
+from pydantic import BaseModel
 
-# ============== CONFIG ==============
-SHEET_ID = os.getenv("SPREADSHEET_ID")                      # preferred
-SHEET_NAME = os.getenv("SHEET_NAME", "AI_Playbook")         # fallback if no SHEET_ID
-SA_PATH = os.getenv("GCP_SA_JSON_PATH", "/app/sa.json")
+# Optional integrations
+USE_TELEGRAM = bool(os.getenv("TELEGRAM_TOKEN")) and bool(os.getenv("TELEGRAM_CHAT_ID"))
+USE_SHEETS   = bool(os.getenv("SHEET_NAME")) and (bool(os.getenv("GCP_SA_JSON")) or bool(os.getenv("GCP_SA_JSON_PATH")))
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/drive.file",
-]
+if USE_TELEGRAM:
+    from telegram import Bot
+    tg_bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
+    TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+if USE_SHEETS:
+    import gspread
+    from google.oauth2.service_account import Credentials
 
-MODEL_PATH = "model.joblib"   # if exists → will be used
+# ---------------------- FastAPI ----------------------
+app = FastAPI(title="AI Playbook — Server-Side Market Scanner", version="1.0.0")
 
-# Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger("ai-playbook")
-
-# ============== GLOBAL STATE (CACHED) ==============
-gc_client: Optional[gspread.Client] = None
-sh: Optional[gspread.Spreadsheet] = None
-ws_today: Optional[gspread.Worksheet] = None
-ws_log: Optional[gspread.Worksheet] = None
-model = None
-
-# simple in-memory metrics
-stats = {
-    "alerts_total": 0,
-    "alerts_today": 0,
-    "rank_counts": {"A": 0, "B": 0, "C": 0},
-    "latencies_ms": deque(maxlen=500),
-    "boot_time": time.time(),
-}
-
-def _is_today(ts: float) -> bool:
-    return time.gmtime(ts).tm_yday == time.gmtime().tm_yday and time.gmtime(ts).tm_year == time.gmtime().tm_year
-
-# ============== GOOGLE SHEETS ==============
-def connect_to_sheets() -> Tuple[Optional[gspread.Client], Optional[gspread.Spreadsheet]]:
-    global gc_client, sh
-    try:
-        creds = Credentials.from_service_account_file(SA_PATH, scopes=SCOPES)
-        gc_client = gspread.authorize(creds)
-        sh = gc_client.open_by_key(SHEET_ID) if SHEET_ID else gc_client.open(SHEET_NAME)
-        titles = [w.title for w in sh.worksheets()]
-        log.info(f"✅ Connected to Google Sheets | Worksheets: {titles}")
-        return gc_client, sh
-    except Exception as e:
-        log.error(f"❌ Sheets connection failed: {e}")
-        gc_client, sh = None, None
-        return None, None
-
-def ensure_worksheets():
-    """Ensure Today_Watchlist & Alerts_Log exist and cache them."""
-    global ws_today, ws_log
-    if not sh:
-        return
-    # Today_Watchlist
-    try:
-        ws_today = sh.worksheet("Today_Watchlist")
-    except gspread.WorksheetNotFound:
-        ws_today = sh.add_worksheet(title="Today_Watchlist", rows=4000, cols=16)
-        ws_today.append_row([
-            "Timestamp","Symbol","TF","Price","RSI","MACD","VolSpike","Breakout%","Gap%",
-            "A_Score","Rank","Reason"
-        ])
-    # Alerts_Log
-    try:
-        ws_log = sh.worksheet("Alerts_Log")
-    except gspread.WorksheetNotFound:
-        ws_log = sh.add_worksheet(title="Alerts_Log", rows=100000, cols=16)
-        ws_log.append_row([
-            "Timestamp","Symbol","TF","Price","RSI","MACD","VolSpike","Breakout%","Gap%",
-            "A_Score","Rank","Outcome","Notes"
-        ])
-    log.info("🗂️ Worksheets ready: Today_Watchlist, Alerts_Log")
-
-# ============== SCORING ==============
-def heuristic_score(rsi: float, macd: float, volSpike: float, breakoutPct: float, gapPct: float) -> int:
-    """
-    Simple, fast, explainable baseline score (0-100).
-    """
-    try:
-        rsi_center = 60.0
-        rsi_score = max(0.0, 1.0 - abs(rsi - rsi_center) / 10.0)
-        macd_score = np.tanh(max(0.0, macd) * 3.0)
-        vol_score = np.tanh((volSpike - 1.0))
-        bo_score = np.tanh(max(0.0, breakoutPct) * 8.0)
-        gap_penalty = np.tanh(max(0.0, abs(gapPct) - 0.03) * 4.0)
-        base = (0.25*rsi_score + 0.25*macd_score + 0.25*vol_score + 0.25*bo_score)
-        score = (base - 0.10*gap_penalty) * 100
-        return int(max(0, min(100, round(score))))
-    except Exception:
-        return 0
-
-def rank_from_score(score: int) -> str:
-    return "A" if score >= 78 else "B" if score >= 65 else "C"
-
-def ai_score_or_fallback(rsi, macd, volSpike, breakoutPct, gapPct) -> Tuple[int, str]:
-    """
-    Compute base heuristic score, and if a trained model exists use it to refine.
-    Model was trained on features: [RSI, MACD, VolSpike, Breakout%, Gap%, A_Score]
-    where A_Score is the heuristic baseline.
-    """
-    base = heuristic_score(rsi, macd, volSpike, breakoutPct, gapPct)
-    if model:
-        try:
-            features = np.array([[rsi, macd, volSpike, breakoutPct, gapPct, base]], dtype=float)
-            prob = float(model.predict_proba(features)[0][1])
-            score = int(max(0, min(100, round(prob * 100))))
-            reason = f"AI prob={prob:.2f} | base={base}"
-            return score, reason
-        except Exception as e:
-            log.warning(f"AI scoring failed, fallback to base. Err: {e}")
-    # fallback
-    return base, f"BASE={base}"
-
-# ============== TELEGRAM (optional) ==============
-def notify_telegram(text: str):
-    import requests
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=4)
-    except Exception as e:
-        log.warning(f"Telegram notify failed: {e}")
-
-# ============== FASTAPI APP & LIFESPAN ==============
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global model
-    log.info("🚀 Starting AI Playbook service...")
-    # load model if exists
-    try:
-        model = load(MODEL_PATH)
-        log.info("🧠 Loaded XGBoost model.")
-    except Exception:
-        model = None
-        log.info("ℹ️ No model found — using heuristic scoring.")
-
-    # connect sheets and ensure worksheets
-    connect_to_sheets()
-    if sh:
-        ensure_worksheets()
-    yield
-    log.info("🛑 Shutting down AI Playbook service...")
-
-app = FastAPI(title="AI Playbook", version="1.0.0", lifespan=lifespan)
-
-# ============== ROUTES ==============
 @app.get("/")
 def root():
-    up_seconds = int(time.time() - stats["boot_time"])
-    return {"status": "ok", "message": "AI Playbook API running", "uptime_sec": up_seconds}
+    return {"status": "ok", "message": "Server-Side Scanner ready"}
 
-@app.get("/stats")
-def get_stats():
-    lat = list(stats["latencies_ms"])
-    avg = round(sum(lat)/len(lat), 2) if lat else 0.0
-    return {
-        "alerts_total": stats["alerts_total"],
-        "alerts_today": stats["alerts_today"],
-        "rank_counts": stats["rank_counts"],
-        "avg_latency_ms_last_500": avg
-    }
+# ---------------------- Utils ----------------------
 
-@app.post("/webhook")
-async def webhook(request: Request):
-    t0 = time.time()
-    data = await request.json()
-    log.info(f"📩 Alert: {data}")
+def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(gain, index=series.index).ewm(alpha=1/length, adjust=False).mean()
+    roll_down = pd.Series(loss, index=series.index).ewm(alpha=1/length, adjust=False).mean()
+    rs = roll_up / (roll_down.replace(0, np.nan))
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(0)
+
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
+
+def macd_hist(close: pd.Series, fast: int=12, slow: int=26, signal: int=9) -> pd.Series:
+    macd_line = ema(close, fast) - ema(close, slow)
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return hist
+
+def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    high = df['High']; low = df['Low']; close = df['Close']
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/length, adjust=False).mean()
+
+# ---------------------- Scoring ----------------------
+
+def score_row(row: pd.Series) -> Dict[str, Any]:
+    score = 0.0
+    # Weights similar to Pine v5.2
+    score += 15 if row['RSI'] > 60 else 10 if row['RSI'] > 55 else 0
+    score += 15 if row['MACD_Hist'] > 0 else 0
+    score += 20 if row['VolSpike'] else 0
+    score += 20 if row['Breakout'] else 0
+    score += 10 if row['StrongCandle'] else 0
+    score += 10 if row['RR'] > 2.0 else 0
+    score += 10 if row['TrendUp'] else 0
+    rating = 'A' if score >= 80 else 'B' if score >= 65 else 'C' if score >= 50 else 'X'
+    return {"score": round(float(score), 2), "rating": rating}
+
+# ---------------------- Scanner Core ----------------------
+
+DEFAULT_UNIVERSE = os.getenv("UNIVERSE", "AAPL,MSFT,NVDA,AMD,AMZN,META,GOOGL,IONQ,SOUN,RBLX,MSTR,GWH,LAC,HBM,SOFI,AFRM,NET,DDOG,CRDO,ABNB,SHOP,TSLA,PLTR,ROKU,SNAP,INTC,AVGO,LLY,NKE,NRG,DKNG,AES").split(',')
+
+class ScanParams(BaseModel):
+    universe: List[str] = DEFAULT_UNIVERSE
+    period: str = "6mo"
+    interval: str = "1d"
+    price_max: float = 50.0
+    price_min: float = 1.0
+    vol_min: float = 300_000
+    lookback_high: int = 20
+    breakout_mult: float = 1.02
+
+
+def enrich_and_score(tickers: List[str], period: str, interval: str, lookback_high: int, breakout_mult: float) -> pd.DataFrame:
+    if not tickers:
+        return pd.DataFrame()
+
+    data = yf.download(tickers=tickers, period=period, interval=interval, auto_adjust=False, progress=False, group_by='ticker', threads=True)
+    rows: List[Dict[str, Any]] = []
+
+    # Single-ticker case: yfinance returns a single-level columns DF
+    single = False
+    if isinstance(data.columns, pd.MultiIndex) is False:
+        single = True
+
+    for t in tickers:
+        try:
+            df = None
+            if single:
+                df = data.copy()
+            else:
+                if t not in data.columns.levels[0]:
+                    continue
+                df = data[t].copy()
+
+            df = df.dropna()
+            if df.empty or len(df) < 60:
+                continue
+
+            df['EMA50'] = ema(df['Close'], 50)
+            df['EMA200'] = ema(df['Close'], 200)
+            df['RSI'] = rsi(df['Close'], 14)
+            df['MACD_Hist'] = macd_hist(df['Close'])
+            df['VolSMA20'] = df['Volume'].rolling(20).mean()
+            df['VolSpike'] = df['Volume'] > df['VolSMA20'] * 1.8
+            df['High20'] = df['High'].rolling(lookback_high).max().shift(1)
+            df['Breakout'] = df['Close'] > (df['High20'] * breakout_mult)
+            df['StrongCandle'] = (df['Close'] > df['Open'] * 1.02) & (df['Close'] >= df['High'] * 0.999)
+            df['ATR14'] = atr(df, 14)
+            df['RR'] = (df['High'] - df['Low']) / df['ATR14']
+            df['TrendUp'] = df['EMA50'] > df['EMA200']
+
+            last = df.iloc[-1]
+            s = score_row(last)
+
+            rows.append({
+                "symbol": t,
+                "close": round(float(last['Close']), 4),
+                "change_%": round(float((last['Close']/df['Close'].iloc[-2]-1)*100), 2) if len(df) > 1 else 0.0,
+                "volume": int(last['Volume']),
+                "vol_x": round(float(last['Volume']/max(last['VolSMA20'], 1)), 2),
+                "rsi": round(float(last['RSI']), 2),
+                "macd_hist": round(float(last['MACD_Hist']), 4),
+                "atr": round(float(last['ATR14']), 4),
+                "trend_up": bool(last['TrendUp']),
+                "breakout": bool(last['Breakout']),
+                "score": s['score'],
+                "rating": s['rating']
+            })
+        except Exception as e:
+            # Skip problematic ticker
+            continue
+
+    df_out = pd.DataFrame(rows)
+    if df_out.empty:
+        return df_out
+    df_out = df_out.sort_values(["rating", "score", "vol_x", "change_%"], ascending=[True, False, False, False])
+    return df_out
+
+# ---------------------- Sheets & Telegram ----------------------
+
+def append_to_sheets(df: pd.DataFrame, worksheet_name: str = "Today_Watchlist"):
+    if not USE_SHEETS or df.empty:
+        return
+    creds = None
+    if os.getenv("GCP_SA_JSON"):
+        info = json.loads(os.getenv("GCP_SA_JSON"))
+        creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"]) 
+    else:
+        path = os.getenv("GCP_SA_JSON_PATH", "/app/sa.json")
+        creds = Credentials.from_service_account_file(path, scopes=["https://www.googleapis.com/auth/spreadsheets"]) 
+
+    gc = gspread.authorize(creds)
+    sh = None
+    sheet_name = os.getenv("SHEET_NAME", "AI_Playbook")
+    try:
+        sh = gc.open(sheet_name)
+    except Exception:
+        sh = gc.create(sheet_name)
 
     try:
-        symbol      = data.get("symbol")
-        tf          = str(data.get("tf"))
-        price       = float(data.get("price", 0))
-        rsi         = float(data.get("rsi", 0))
-        macd        = float(data.get("macd", 0))
-        volSpike    = float(data.get("volSpike", 0))
-        breakoutPct = float(data.get("breakoutPct", 0))
-        gapPct      = float(data.get("gapPct", 0))
-    except Exception as e:
-        log.error(f"Bad payload: {e}")
-        return {"ok": False, "error": "invalid payload"}
+        ws = sh.worksheet(worksheet_name)
+    except Exception:
+        ws = sh.add_worksheet(title=worksheet_name, rows="1000", cols="20")
+        ws.append_row(list(df.columns))
 
-    ts = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
+    rows = df.values.tolist()
+    for r in rows:
+        ws.append_row(r)
 
-    # ensure connection (self-heal)
-    if not sh:
-        connect_to_sheets()
-        if sh:
-            ensure_worksheets()
 
-    # compute score
-    score, reason_detail = ai_score_or_fallback(rsi, macd, volSpike, breakoutPct, gapPct)
-    rank = rank_from_score(score)
-    reason = f"RSI≈{rsi:.1f}, MACDΔ≈{macd:.2f}, Vol×{volSpike:.1f}, BO {breakoutPct:.1%}, Gap {gapPct:.1%} | {reason_detail}"
+def notify_telegram(df: pd.DataFrame):
+    if not USE_TELEGRAM or df.empty:
+        return
+    top = df[df['rating'] == 'A'].head(10)
+    if top.empty:
+        return
+    lines = ["🔥 A‑Ready Breakouts (Server Scanner) 🔥"]
+    for _, row in top.iterrows():
+        lines.append(f"{row['symbol']}: {row['close']} | RSI {row['rsi']} | Vol× {row['vol_x']} | Score {row['score']}")
+    msg = "\n".join(lines)
+    tg_bot.send_message(chat_id=TG_CHAT_ID, text=msg)
 
-    # write rows
-    if sh:
-        # Today_Watchlist
-        try:
-            if ws_today is None:
-                ensure_worksheets()
-            ws_today.append_row([
-                ts, symbol, tf, price, rsi, macd, volSpike, breakoutPct, gapPct, score, rank, reason
-            ])
-            log.info(f"✅ Watchlist {symbol} ({tf}) — {score} ({rank})")
-        except Exception as e:
-            log.error(f"Error writing Today_Watchlist: {e}")
+# ---------------------- API Endpoints ----------------------
 
-        # Alerts_Log
-        try:
-            if ws_log is None:
-                ensure_worksheets()
-            ws_log.append_row([
-                ts, symbol, tf, price, rsi, macd, volSpike, breakoutPct, gapPct, score, rank, "", ""
-            ])
-            log.info(f"🧠 Logged {symbol} ({tf}) in Alerts_Log")
-        except Exception as e:
-            log.error(f"Error writing Alerts_Log: {e}")
+@app.post("/scan")
+def scan(params: ScanParams):
+    # Filter universe roughly by price/volume using latest close via yf fast info (lightweight)
+    universe = [t.strip().upper() for t in params.universe if t.strip()]
+    df = enrich_and_score(universe, params.period, params.interval, params.lookback_high, params.breakout_mult)
+    if df.empty:
+        return {"count": 0, "results": []}
 
-    # notify for A
-    if rank == "A":
-        notify_telegram(f"A-Trigger {symbol} ({tf}) — Score {score}\n{reason}")
+    # Hard filters
+    df = df[(df['close'] >= params.price_min) & (df['close'] <= params.price_max) & (df['volume'] >= params.vol_min)]
+    df = df.reset_index(drop=True)
 
-    # update stats
-    stats["alerts_total"] += 1
-    if _is_today(time.time()):
-        stats["alerts_today"] += 1
-    stats["rank_counts"][rank] = stats["rank_counts"].get(rank, 0) + 1
+    # Write & notify
+    append_to_sheets(df)
+    notify_telegram(df)
 
-    latency_ms = round((time.time() - t0) * 1000, 2)
-    stats["latencies_ms"].append(latency_ms)
-    log.info(f"⏱️ Latency: {latency_ms} ms")
+    return {"count": int(len(df)), "results": df.to_dict(orient='records')}
 
-    return {"ok": True, "symbol": symbol, "score": score, "rank": rank, "latency_ms": latency_ms}
+@app.get("/scan/simple")
+def scan_simple(universe: str = Query(
+        ",".join(DEFAULT_UNIVERSE), description="Comma-separated tickers")):
+    tickers = [t.strip().upper() for t in universe.split(',') if t.strip()]
+    df = enrich_and_score(tickers, "6mo", "1d", 20, 1.02)
+    if df.empty:
+        return {"count": 0, "results": []}
+    return {"count": int(len(df)), "results": df.to_dict(orient='records')}
+
+# ---------------------- CLI helper ----------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
