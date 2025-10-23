@@ -73,3 +73,85 @@ async def scan_watchlist():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+# בתחילת הקובץ הוסף:
+from .tradingview import TradingViewWebhook
+
+# הוסף לפני if __name__ == "__main__":
+
+@app.post("/api/tradingview/webhook")
+async def tradingview_webhook(request: Request):
+    """
+    מקבל webhook מ-TradingView
+    """
+    try:
+        # פרס את הנתונים מ-TradingView
+        tv_data = await TradingViewWebhook.parse_alert(request)
+        symbol = tv_data.get("symbol", "").upper()
+        
+        if not symbol:
+            raise HTTPException(status_code=400, detail="Missing symbol")
+        
+        # מושך נתוני מניה
+        stock_data = await scanner.fetch_stock_data(symbol)
+        
+        # מריץ prediction
+        result = await scanner.scan_single(symbol, threshold=0.5)
+        
+        if result:
+            # מעצב את התשובה
+            signal = TradingViewWebhook.format_signal(
+                result["prediction"],
+                symbol,
+                result["last_price"]
+            )
+            
+            return {
+                "success": True,
+                "symbol": symbol,
+                "signal": signal,
+                "prediction": result["prediction"],
+                "confidence": result["confidence"],
+                "price": result["last_price"],
+                "recommendation": "BUY" if result["prediction"] >= 0.55 else "HOLD" if result["prediction"] >= 0.45 else "AVOID"
+            }
+        else:
+            return {
+                "success": True,
+                "symbol": symbol,
+                "signal": "⚠️ NO SIGNAL",
+                "recommendation": "HOLD"
+            }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/tradingview/batch-webhook")
+async def tradingview_batch_webhook(request: Request):
+    """
+    מקבל מספר סימנלים בבת אחת
+    """
+    try:
+        data = await request.json()
+        symbols = data.get("symbols", [])
+        
+        if not symbols:
+            raise HTTPException(status_code=400, detail="No symbols provided")
+        
+        results = []
+        for symbol in symbols:
+            try:
+                result = await scanner.scan_single(symbol.upper(), threshold=0.5)
+                if result:
+                    results.append(result)
+            except:
+                continue
+        
+        return {
+            "success": True,
+            "count": len(results),
+            "signals": results
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
