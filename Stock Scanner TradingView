@@ -1,0 +1,64 @@
+# stock_scanner/tradingview.py
+from fastapi import Request, HTTPException
+from typing import Dict
+import json
+from datetime import datetime
+
+class TradingViewWebhook:
+    """
+    מקבל webhooks מ-TradingView ומעבד אותם
+    """
+    
+    @staticmethod
+    async def parse_alert(request: Request) -> Dict:
+        """
+        מנתח את ה-webhook מ-TradingView
+        """
+        try:
+            # TradingView שולח JSON
+            body = await request.json()
+            
+            # פורמט טיפוסי של TradingView webhook:
+            # {
+            #   "ticker": "AAPL",
+            #   "price": 150.25,
+            #   "volume": 50000000,
+            #   "indicator_value": 65.5,
+            #   "timestamp": "2024-01-15T10:30:00Z"
+            # }
+            
+            return {
+                "symbol": body.get("ticker", body.get("symbol")),
+                "price": float(body.get("price", 0)),
+                "volume": int(body.get("volume", 0)),
+                "timestamp": body.get("timestamp"),
+                "raw_data": body
+            }
+        
+        except json.JSONDecodeError:
+            # אם TradingView שלח טקסט רגיל
+            text = await request.body()
+            return {"raw_text": text.decode()}
+        
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid webhook: {str(e)}")
+    
+    @staticmethod
+    def format_signal(prediction: float, symbol: str, price: float) -> str:
+        """
+        ממיר תחזית לפורמט ברור
+        """
+        if prediction >= 0.7:
+            signal = "🚀 STRONG BUY"
+            emoji = "💰"
+        elif prediction >= 0.55:
+            signal = "✅ BUY"
+            emoji = "📈"
+        elif prediction >= 0.45:
+            signal = "⚠️ NEUTRAL"
+            emoji = "⏸️"
+        else:
+            signal = "❌ AVOID"
+            emoji = "📉"
+        
+        return f"{emoji} {symbol} @ ${price:.2f} | Signal: {signal} | Confidence: {prediction*100:.1f}%"
