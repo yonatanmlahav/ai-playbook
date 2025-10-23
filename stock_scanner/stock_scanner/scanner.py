@@ -1,0 +1,78 @@
+# stock_scanner/scanner.py
+import yfinance as yf
+from datetime import datetime, timedelta
+from typing import List, Dict
+from .integration import IntegratedModel
+
+class StockScanner:
+    def __init__(self):
+        self.model = IntegratedModel()
+    
+    async def fetch_stock_data(self, symbol: str) -> List[Dict]:
+        """מושך נתוני מניה מ-yfinance"""
+        try:
+            stock = yf.Ticker(symbol)
+            
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=150)
+            
+            df = stock.history(start=start_date, end=end_date)
+            
+            if df.empty:
+                raise ValueError(f"No data for {symbol}")
+            
+            data = []
+            for date, row in df.iterrows():
+                data.append({
+                    "date": date.strftime("%Y-%m-%d"),
+                    "open": float(row["Open"]),
+                    "high": float(row["High"]),
+                    "low": float(row["Low"]),
+                    "close": float(row["Close"]),
+                    "volume": int(row["Volume"])
+                })
+            
+            return data[-100:]
+        
+        except Exception as e:
+            print(f"Error fetching {symbol}: {e}")
+            raise e
+    
+    async def scan_single(self, symbol: str, threshold: float = 0.5) -> Dict:
+        """סורק מניה בודדת"""
+        data = await self.fetch_stock_data(symbol)
+        
+        if len(data) < 50:
+            return None
+        
+        # חזה באמצעות המודל שלך
+        probability, label = self.model.predict(data)
+        
+        if probability >= threshold:
+            return {
+                "symbol": symbol,
+                "prediction": probability,
+                "label": label,
+                "confidence": probability * 100,
+                "last_price": data[-1]["close"],
+                "change_pct": ((data[-1]["close"] - data[-2]["close"]) / data[-2]["close"] * 100),
+                "volume": data[-1]["volume"],
+                "date": data[-1]["date"]
+            }
+        
+        return None
+    
+    async def scan_multiple(self, symbols: List[str], threshold: float = 0.5) -> List[Dict]:
+        """סורק מספר מניות"""
+        results = []
+        
+        for symbol in symbols:
+            try:
+                result = await self.scan_single(symbol, threshold)
+                if result:
+                    results.append(result)
+            except Exception as e:
+                print(f"Error scanning {symbol}: {e}")
+                continue
+        
+        return sorted(results, key=lambda x: x["prediction"], reverse=True)
