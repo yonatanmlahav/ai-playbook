@@ -3,14 +3,12 @@ numpy
 gspread
 google-auth
 google-auth-oauthlib
-google-auth-httplib2
 xgboost
 scikit-learn
 joblib
 lightgbm
 fastapi
-uvicorn[standard]
+uvicorn
 yfinance
-ta
-aiohttp
+ta-lib
 python-multipart
